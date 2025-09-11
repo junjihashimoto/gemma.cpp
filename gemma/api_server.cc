@@ -28,6 +28,7 @@
 #include <atomic>
 #include <chrono>
 #include <sstream>
+#include <ctime>
 #include <iomanip>
 #include <mutex>
 #include <unordered_map>
@@ -54,6 +55,31 @@ using json = nlohmann::json;
 namespace gcpp {
 
 static std::atomic<bool> server_running{true};
+
+// Logging function for requests
+void LogRequest(const httplib::Request& req, const std::string& handler_name, int status = 0) {
+  auto now = std::chrono::system_clock::now();
+  auto time_t = std::chrono::system_clock::to_time_t(now);
+  char time_str[100];
+  std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", std::localtime(&time_t));
+  
+  std::cerr << "[" << time_str << "] ";
+  std::cerr << req.method << " " << req.path;
+  if (!req.get_param_value("alt").empty()) {
+    std::cerr << "?alt=" << req.get_param_value("alt");
+  }
+  std::cerr << " from " << req.remote_addr;
+  std::cerr << " | Handler: " << handler_name;
+  if (status != 0) {
+    std::cerr << " | Status: " << status;
+  }
+  std::cerr << std::endl;
+  
+  // Log request body for POST requests
+  if (req.method == "POST" && !req.body.empty()) {
+    std::cerr << "  Request body: " << req.body << std::endl;
+  }
+}
 
 // Server state holding model and KV caches
 struct ServerState {
@@ -186,6 +212,8 @@ json CreateAPIResponse(const std::string& text, bool is_streaming_chunk = false)
 
 // Handle generateContent endpoint (non-streaming)
 void HandleGenerateContentNonStreaming(ServerState& state, const httplib::Request& req, httplib::Response& res) {
+  LogRequest(req, "HandleGenerateContentNonStreaming");
+  
   try {
     json request = json::parse(req.body);
 
@@ -275,11 +303,14 @@ void HandleGenerateContentNonStreaming(ServerState& state, const httplib::Reques
         json{{"error", {{"message", std::string("Server error: ") + e.what()}}}}
             .dump(),
         "application/json");
+    LogRequest(req, "HandleGenerateContentNonStreaming", res.status);
   }
 }
 
 // Handle streamGenerateContent endpoint with SSE)
 void HandleGenerateContentStreaming(ServerState& state, const httplib::Request& req, httplib::Response& res) {
+  LogRequest(req, "HandleGenerateContentStreaming");
+  
   try {
     json request = json::parse(req.body);
 
@@ -395,11 +426,66 @@ void HandleGenerateContentStreaming(ServerState& state, const httplib::Request& 
               {{"message", std::string("JSON parsing error: ") + e.what()}}}}
             .dump(),
         "application/json");
+    LogRequest(req, "HandleGenerateContentStreaming", res.status);
+  }
+}
+
+// Handle countTokens endpoint
+void HandleCountTokens(ServerState& state, const httplib::Request& req, httplib::Response& res) {
+  LogRequest(req, "HandleCountTokens");
+  
+  try {
+    json request = json::parse(req.body);
+    
+    // Extract prompt from API format
+    std::string prompt;
+    if (request.contains("contents")) {
+      prompt = WrapMessagesWithTurnMarkers(request["contents"]);
+    } else {
+      res.status = 400;
+      res.set_content(json{{"error", {{"message", "Missing 'contents' field"}}}}.dump(), 
+                      "application/json");
+      LogRequest(req, "HandleCountTokens", res.status);
+      return;
+    }
+    
+    // Tokenize the prompt
+    std::vector<int> token_ids;
+    const auto& tokenizer = state.gemma->Tokenizer();
+    
+    if (!tokenizer.Encode(prompt, &token_ids)) {
+      res.status = 500;
+      res.set_content(json{{"error", {{"message", "Failed to tokenize input"}}}}.dump(), 
+                      "application/json");
+      LogRequest(req, "HandleCountTokens", res.status);
+      return;
+    }
+    
+    // Create response according to Google Cloud Vertex AI API format
+    json response = {
+      {"totalTokens", static_cast<int>(token_ids.size())},
+      {"totalBillableCharacters", static_cast<int>(prompt.length())}
+    };
+    
+    res.set_content(response.dump(), "application/json");
+    
+  } catch (const json::exception& e) {
+    res.status = 400;
+    res.set_content(json{{"error", {{"message", std::string("JSON parsing error: ") + e.what()}}}}.dump(), 
+                    "application/json");
+    LogRequest(req, "HandleCountTokens", res.status);
+  } catch (const std::exception& e) {
+    res.status = 500;
+    res.set_content(json{{"error", {{"message", std::string("Server error: ") + e.what()}}}}.dump(), 
+                    "application/json");
+    LogRequest(req, "HandleCountTokens", res.status);
   }
 }
 
 // Handle models list endpoint
 void HandleListModels(ServerState& state, const InferenceArgs& inference, const httplib::Request& req, httplib::Response& res) {
+  LogRequest(req, "HandleListModels");
+  
   json response = {
     {"models", {{
       {"name", "models/" + inference.model},
@@ -438,7 +524,8 @@ void RunServer(const LoaderArgs& loader, const ThreadingArgs& threading,
   httplib::Server server;
 
   // Set up routes
-  server.Get("/", [&inference](const httplib::Request&, httplib::Response& res) {
+  server.Get("/", [&inference](const httplib::Request& req, httplib::Response& res) {
+    LogRequest(req, "Root");
     res.set_content("API Server (gemma.cpp) - Use POST /v1beta/models/" + inference.model + ":generateContent", "text/plain");
   });
 
@@ -455,7 +542,11 @@ void RunServer(const LoaderArgs& loader, const ThreadingArgs& threading,
   server.Post(model_endpoint + ":streamGenerateContent", [&state](const httplib::Request& req, httplib::Response& res) {
     HandleGenerateContentStreaming(state, req, res);
   });
-
+  
+  server.Post(model_endpoint + ":countTokens", [&state](const httplib::Request& req, httplib::Response& res) {
+    HandleCountTokens(state, req, res);
+  });
+  
   // Periodic cleanup of old sessions
   std::thread cleanup_thread([&state]() {
     while (server_running) {
@@ -463,12 +554,29 @@ void RunServer(const LoaderArgs& loader, const ThreadingArgs& threading,
       state.CleanupOldSessions();
     }
   });
-
+  
+  // Default handler for unmatched requests
+  server.set_error_handler([](const httplib::Request& req, httplib::Response& res) {
+    LogRequest(req, "UnmatchedRequest", res.status);
+    if (res.status == 404) {
+      json error_response = {
+        {"error", {
+          {"code", 404},
+          {"message", "Not Found"},
+          {"details", "The requested endpoint does not exist"}
+        }}
+      };
+      res.set_content(error_response.dump(), "application/json");
+    }
+  });
+  
   std::cerr << "Starting API server on port " << inference.port << std::endl;
   std::cerr << "Model loaded successfully" << std::endl;
+  std::cerr << "Request logging enabled - all requests will be logged to stderr" << std::endl;
   std::cerr << "Endpoints:" << std::endl;
   std::cerr << "  POST /v1beta/models/" << inference.model << ":generateContent" << std::endl;
   std::cerr << "  POST /v1beta/models/" << inference.model << ":streamGenerateContent (SSE)" << std::endl;
+  std::cerr << "  POST /v1beta/models/" << inference.model << ":countTokens" << std::endl;
   std::cerr << "  GET  /v1beta/models" << std::endl;
 
   if (!server.listen("0.0.0.0", inference.port)) {

@@ -136,7 +136,35 @@ data: {"candidates":[{"content":{"parts":[{"text":" sky"}],"role":"model"},"inde
 data: [DONE]
 ```
 
-### 3. List Models - `GET /v1beta/models`
+### 3. Count Tokens - `POST /v1beta/models/gemma3-4b:countTokens`
+
+Count the number of tokens in the input without generating a response. Useful for:
+- Preventing requests from exceeding the model context window
+- Estimating costs based on token count  
+- Understanding input complexity before generation
+
+**Request:**
+```json
+{
+  "contents": [
+    {
+      "parts": [
+        {"text": "Hello, how are you?"}
+      ]
+    }
+  ]
+}
+```
+
+**Response:**
+```json
+{
+  "totalTokens": 8,
+  "totalBillableCharacters": 18
+}
+```
+
+### 4. List Models - `GET /v1beta/models`
 
 List available models.
 
@@ -172,6 +200,13 @@ curl -X POST http://localhost:8080/v1beta/models/gemma3-4b:streamGenerateContent
   -d '{
     "contents": [{"parts": [{"text": "Tell me a story"}]}],
     "generationConfig": {"temperature": 0.9, "topK": 1, "maxOutputTokens": 1024}
+  }'
+
+# Count tokens  
+curl -X POST http://localhost:8080/v1beta/models/gemma3-4b:countTokens \
+  -H "Content-Type: application/json" \
+  -d '{
+    "contents": [{"parts": [{"text": "Hello, how are you?"}]}]
   }'
 
 # List models

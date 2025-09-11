@@ -105,6 +105,48 @@ public:
     }
   }
 
+  void TestCountTokens(const std::string& text) {
+    std::cout << "\n" << BOLD << CYAN << "🔢 Testing CountTokens API" << RESET << std::endl;
+    
+    // Create request
+    json request = CreateAPIRequest(text);
+    
+    // Determine endpoint
+    std::string endpoint;
+    if (!api_key_.empty()) {
+      endpoint = "/v1beta/models/" + model_ + ":countTokens";
+    } else {
+      endpoint = "/v1beta/models/" + model_ + ":countTokens";
+    }
+    
+    // Make request
+    httplib::Headers headers;
+    headers.emplace("Content-Type", "application/json");
+    if (!api_key_.empty()) {
+      headers.emplace("X-goog-api-key", api_key_);
+    }
+    
+    auto res = use_https_ ? ssl_client_->Post(endpoint.c_str(), headers, request.dump(), "application/json")
+                          : client_->Post(endpoint.c_str(), headers, request.dump(), "application/json");
+    
+    if (res && res->status == 200) {
+      json response = json::parse(res->body);
+      std::cout << GREEN << "✅ Token count result:" << RESET << std::endl;
+      std::cout << "   Input text: \"" << text << "\"" << std::endl;
+      if (response.contains("totalTokens")) {
+        std::cout << "   Total tokens: " << response["totalTokens"] << std::endl;
+      }
+      if (response.contains("totalBillableCharacters")) {
+        std::cout << "   Billable characters: " << response["totalBillableCharacters"] << std::endl;
+      }
+    } else {
+      std::cerr << RED << "❌ CountTokens request failed. Status: " << (res ? res->status : -1) << RESET << std::endl;
+      if (res && !res->body.empty()) {
+        std::cerr << "   Response: " << res->body << std::endl;
+      }
+    }
+  }
+
   void InteractiveChat() {
     std::cout << "\n" << BOLD << CYAN << "💬 Interactive Chat Mode (with session)" << RESET << std::endl;
     std::cout << "Type ':gemma %q' to end.\n" << std::endl;
@@ -345,6 +387,7 @@ int main(int argc, char* argv[]) {
       client.InteractiveChat();
     } else {
       client.TestListModels();
+      client.TestCountTokens(client_args.prompt);
       client.TestGenerateContent(client_args.prompt, true);
     }
     
