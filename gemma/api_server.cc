@@ -86,6 +86,7 @@ struct ServerState {
   std::unique_ptr<Gemma> gemma;
   MatMulEnv* env;
   ThreadingContext* ctx;
+  InferenceArgs inference_args;  // Store command-line arguments
 
   // Session-based KV cache storage
   struct Session {
@@ -116,7 +117,7 @@ struct ServerState {
     std::lock_guard<std::mutex> lock(sessions_mutex);
     auto& session = sessions[session_id];
     if (!session.kv_cache) {
-      session.kv_cache = std::make_unique<KVCache>(gemma->Config(), InferenceArgs(), env->ctx.allocator);
+      session.kv_cache = std::make_unique<KVCache>(gemma->Config(), inference_args, env->ctx.allocator);
     }
     session.last_access = std::chrono::steady_clock::now();
     return session;
@@ -162,15 +163,30 @@ std::string WrapMessagesWithTurnMarkers(const json& contents) {
   return prompt;
 }
 
-// Parse generation config
-RuntimeConfig ParseGenerationConfig(const json& request) {
-  RuntimeConfig config;
-  config.verbosity = 0;
+// Check if request is asking for JSON output
+bool IsJSONModeRequest(const json& request) {
+  if (request.contains("generationConfig")) {
+    auto& gen_config = request["generationConfig"];
+    if (gen_config.contains("responseMimeType")) {
+      std::string mime_type = gen_config["responseMimeType"].get<std::string>();
+      return mime_type == "application/json";
+    }
+  }
+  return false;
+}
 
-  // Set defaults matching public API
-  config.temperature = 1.0f;
-  config.top_k = 1;
-  config.max_generated_tokens = 8192;
+// Parse generation config
+RuntimeConfig ParseGenerationConfig(const json& request, const InferenceArgs& inference_args) {
+  RuntimeConfig config;
+  
+  config.verbosity = inference_args.verbosity;
+  config.temperature = inference_args.temperature;
+  config.top_k = inference_args.top_k;
+  
+  // For batch sizes and max tokens, use inference_args values (they have their own defaults)
+  config.max_generated_tokens = inference_args.max_generated_tokens;
+  config.prefill_tbatch_size = inference_args.prefill_tbatch_size;
+  config.decode_qbatch_size = inference_args.decode_qbatch_size;
 
   if (request.contains("generationConfig")) {
     auto& gen_config = request["generationConfig"];
@@ -225,6 +241,17 @@ void HandleGenerateContentNonStreaming(ServerState& state, const httplib::Reques
     std::string prompt;
     if (request.contains("contents")) {
       prompt = WrapMessagesWithTurnMarkers(request["contents"]);
+      
+      // Add JSON mode instruction if requested
+      if (IsJSONModeRequest(request)) {
+        // Check if this is a next speaker determination request
+        if (prompt.find("who should logically speak next") != std::string::npos || 
+            prompt.find("Decision Rules") != std::string::npos) {
+          prompt += "\n\nRespond with valid JSON in this exact format: {\"nextSpeaker\": \"user\"} or {\"nextSpeaker\": \"model\"}";
+        } else {
+          prompt += "\n\nPlease respond with valid JSON only. Do not include any explanatory text outside the JSON response.";
+        }
+      }
     } else {
       res.status = 400;
       res.set_content(json{{"error", {{"message", "Missing 'contents' field"}}}}.dump(), "application/json");
@@ -235,7 +262,7 @@ void HandleGenerateContentNonStreaming(ServerState& state, const httplib::Reques
     std::lock_guard<std::mutex> lock(state.inference_mutex);
 
     // Set up runtime config
-    RuntimeConfig runtime_config = ParseGenerationConfig(request);
+    RuntimeConfig runtime_config = ParseGenerationConfig(request, state.inference_args);
 
     // Collect full response
     std::string full_response;
@@ -322,6 +349,17 @@ void HandleGenerateContentStreaming(ServerState& state, const httplib::Request& 
     std::string prompt;
     if (request.contains("contents")) {
       prompt = WrapMessagesWithTurnMarkers(request["contents"]);
+      
+      // Add JSON mode instruction if requested
+      if (IsJSONModeRequest(request)) {
+        // Check if this is a next speaker determination request
+        if (prompt.find("who should logically speak next") != std::string::npos || 
+            prompt.find("Decision Rules") != std::string::npos) {
+          prompt += "\n\nRespond with valid JSON in this exact format: {\"nextSpeaker\": \"user\"} or {\"nextSpeaker\": \"model\"}";
+        } else {
+          prompt += "\n\nPlease respond with valid JSON only. Do not include any explanatory text outside the JSON response.";
+        }
+      }
     } else {
       res.status = 400;
       res.set_content(json{{"error", {{"message", "Missing 'contents' field"}}}}.dump(), "application/json");
@@ -344,7 +382,7 @@ void HandleGenerateContentStreaming(ServerState& state, const httplib::Request& 
           auto& session = state.GetOrCreateSession(session_id);
 
           // Set up runtime config
-          RuntimeConfig runtime_config = ParseGenerationConfig(request);
+          RuntimeConfig runtime_config = ParseGenerationConfig(request, state.inference_args);
 
           // Tokenize prompt
           std::vector<int> tokens = WrapAndTokenize(
@@ -402,9 +440,9 @@ void HandleGenerateContentStreaming(ServerState& state, const httplib::Request& 
           std::string final_sse = "data: " + final_event.dump() + "\n\n";
           sink.write(final_sse.data(), final_sse.size());
 
-          // Send done event
-          sink.write("data: [DONE]\n\n", 15);
-
+          // Don't send [DONE] - not part of Gemini API spec
+          // The stream ends with finishReason: "STOP" in the last chunk
+          
           // Ensure all data is sent
           sink.done();
 
@@ -520,6 +558,7 @@ void RunServer(const LoaderArgs& loader, const ThreadingArgs& threading,
   state.gemma = std::make_unique<Gemma>(loader, inference, ctx);
   state.env = &env;
   state.ctx = &ctx;
+  state.inference_args = inference;  // Store command-line arguments
 
   httplib::Server server;
 
@@ -547,6 +586,23 @@ void RunServer(const LoaderArgs& loader, const ThreadingArgs& threading,
     HandleCountTokens(state, req, res);
   });
   
+  // Also register wildcard endpoints that accept any model name
+  // This allows compatibility with clients using different model names
+  server.Post("/v1beta/models/:model:generateContent", [&state](const httplib::Request& req, httplib::Response& res) {
+    LogRequest(req, "HandleGenerateContentNonStreaming (wildcard)");
+    HandleGenerateContentNonStreaming(state, req, res);
+  });
+
+  server.Post("/v1beta/models/:model:streamGenerateContent", [&state](const httplib::Request& req, httplib::Response& res) {
+    LogRequest(req, "HandleGenerateContentStreaming (wildcard)");
+    HandleGenerateContentStreaming(state, req, res);
+  });
+  
+  server.Post("/v1beta/models/:model:countTokens", [&state](const httplib::Request& req, httplib::Response& res) {
+    LogRequest(req, "HandleCountTokens (wildcard)");
+    HandleCountTokens(state, req, res);
+  });
+  
   // Periodic cleanup of old sessions
   std::thread cleanup_thread([&state]() {
     while (server_running) {
@@ -563,7 +619,7 @@ void RunServer(const LoaderArgs& loader, const ThreadingArgs& threading,
         {"error", {
           {"code", 404},
           {"message", "Not Found"},
-          {"details", "The requested endpoint does not exist"}
+          {"details", std::string("The requested endpoint does not exist: ") + req.method + " " + req.path}
         }}
       };
       res.set_content(error_response.dump(), "application/json");
@@ -572,12 +628,20 @@ void RunServer(const LoaderArgs& loader, const ThreadingArgs& threading,
   
   std::cerr << "Starting API server on port " << inference.port << std::endl;
   std::cerr << "Model loaded successfully" << std::endl;
+  std::cerr << "Default generation settings from command line:" << std::endl;
+  std::cerr << "  Temperature: " << inference.temperature << std::endl;
+  std::cerr << "  Top-K: " << inference.top_k << std::endl;
+  std::cerr << "  Max tokens: " << inference.max_generated_tokens << std::endl;
+  std::cerr << "  Multiturn: " << (inference.multiturn ? "enabled" : "disabled") << std::endl;
   std::cerr << "Request logging enabled - all requests will be logged to stderr" << std::endl;
   std::cerr << "Endpoints:" << std::endl;
   std::cerr << "  POST /v1beta/models/" << inference.model << ":generateContent" << std::endl;
   std::cerr << "  POST /v1beta/models/" << inference.model << ":streamGenerateContent (SSE)" << std::endl;
   std::cerr << "  POST /v1beta/models/" << inference.model << ":countTokens" << std::endl;
   std::cerr << "  GET  /v1beta/models" << std::endl;
+  std::cerr << std::endl;
+  std::cerr << "Note: The server also accepts any model name in the URL path." << std::endl;
+  std::cerr << "      e.g., /v1beta/models/gemini-2.0-flash:generateContent" << std::endl;
 
   if (!server.listen("0.0.0.0", inference.port)) {
     std::cerr << "Failed to start server on port " << inference.port << std::endl;
